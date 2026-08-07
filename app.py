@@ -205,13 +205,16 @@ with gr.Blocks() as app:
     sw_play_btn.click(fn=None, inputs=[voice_persona_dropdown, sw_voice_cache, sw_raw_download_cache], js=tts_javascript)
     sw_stop_btn.click(fn=None, inputs=None, js=stop_tts_javascript)
 
+import os # Make sure this is added to fetch environment variables
+
 if __name__ == "__main__":
     app.launch(
         auth=("ZeroError", "123456"),
         auth_message="Please log in with your authorized Arro engine credentials.",
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=int(os.environ.get("PORT", 7860)), # <--- CRITICAL FIX
         theme=gr.themes.Default(),
         js=force_light_mode_js,
-        css=login_wall_css
+        css=login_wall_css,
+        ssr_mode=False
     )
