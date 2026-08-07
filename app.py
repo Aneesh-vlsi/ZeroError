@@ -1,8 +1,19 @@
 # app.py
+import sys
+try:
+    import gradio as gr
+    from app_logic import handle_hardware_pipeline, handle_software_pipeline
+    from theme_engine import theme_engine_js, force_light_mode_js, stop_sfx_js, login_wall_css
+    from voice_engine import tts_javascript, stop_tts_javascript
+except Exception as e:
+    print(f"FATAL STARTUP CRASH: {e}")
+    sys.exit(1)
 import gradio as gr
 from app_logic import handle_hardware_pipeline, handle_software_pipeline
 from theme_engine import theme_engine_js, force_light_mode_js, stop_sfx_js, login_wall_css
 from voice_engine import tts_javascript, stop_tts_javascript
+# Add this temporary block right at the very top of app.py
+
 
 # Client-side processing script that handles custom naming and system-level download location prompts
 download_hw_js = """
