@@ -64,6 +64,71 @@ def safe_api_call(contents, system_instruction, manual_override_key=""):
             
     return "QUOTA_ERROR: All project credentials channels are exhausted.", "All Keys Exhausted"
 
+def _extract_pin_tokens(text: str) -> set:
+    """Pulls out every concrete pin/GPIO reference actually present in a chunk
+    of text (code or a wiring table). Used to cross-check that the wiring
+    diagram isn't inventing pins the code never touches.
+    Covers: STM32 literal pins (PA5, PC7...), STM32 register bit-banging
+    (GPIOB_BSRR |= (1U << 0) -> PB0), Arduino D#/A# + pinMode/digitalWrite
+    argument style, and ESP32/8266 GPIO# style.
+    """
+    pins = set()
+
+    # STM32 explicit pin literals, e.g. PA5, PB12, PC7
+    for m in re.finditer(r'\bP([A-K])(\d{1,2})\b', text, re.IGNORECASE):
+        pins.add(f"P{m.group(1).upper()}{m.group(2)}")
+
+    # STM32 register-style bit-banging: GPIOx_<REG> ... << n  -> derive Pxn
+    # (BSRR's upper 16 bits are the "reset" half, so bit index is taken mod 16)
+    for m in re.finditer(r'GPIO([A-K])[A-Za-z_]*\s*[|&]?=?~?\s*\(?\s*\d*U?\s*<<\s*(\d{1,2})', text, re.IGNORECASE):
+        port, bit = m.group(1).upper(), int(m.group(2)) % 16
+        pins.add(f"P{port}{bit}")
+
+    # Arduino-style D0-D99 references
+    for m in re.finditer(r'\bD(\d{1,2})\b', text):
+        pins.add(f"D{m.group(1)}")
+
+    # Arduino function-call style: pinMode(9, ...), digitalWrite(13, ...)
+    for m in re.finditer(r'(?:pinMode|digitalWrite|digitalRead|analogWrite|analogRead)\s*\(\s*(\d{1,2})', text):
+        pins.add(f"D{m.group(1)}")
+
+    # ESP32/ESP8266 style GPIO numbers
+    for m in re.finditer(r'GPIO_NUM_(\d{1,2})', text):
+        pins.add(f"GPIO{m.group(1)}")
+    for m in re.finditer(r'\bGPIO\s?(\d{1,2})\b', text, re.IGNORECASE):
+        pins.add(f"GPIO{m.group(1)}")
+
+    return pins
+
+
+def _verify_wiring_matches_code(wiring_md: str, generated_code: str) -> str:
+    """Cross-checks the pins named in the wiring table against pins actually
+    referenced in the generated firmware. If the model drew a wiring diagram
+    that doesn't correspond to what the code does, surface a visible warning
+    instead of silently showing a possibly-wrong table."""
+    code_pins = _extract_pin_tokens(generated_code)
+    wiring_pins = _extract_pin_tokens(wiring_md)
+
+    # If we can't confidently extract pins from either side, don't guess —
+    # just pass the table through unmodified rather than risk a false alarm.
+    if not code_pins or not wiring_pins:
+        return wiring_md
+
+    mismatched = wiring_pins - code_pins
+    if mismatched:
+        warning = (
+            "> ⚠️ **Consistency check failed:** the wiring table below references "
+            f"{', '.join(sorted(mismatched))}, but that pin does not appear to be "
+            "used anywhere in the generated code (which references "
+            f"{', '.join(sorted(code_pins)) if code_pins else 'no detectable pins'}). "
+            "Please verify the actual pin in the code output above before wiring "
+            "your hardware.\n\n"
+        )
+        return warning + wiring_md
+
+    return wiring_md
+
+
 def infer_hardware_and_generate_code(board: str, components: str, runtime_key: str) -> tuple[str, str, str]:
     clean_board = board.strip().lower()
     
@@ -104,11 +169,39 @@ def infer_hardware_and_generate_code(board: str, components: str, runtime_key: s
 
     clean_code = raw_code.replace("```cpp", "").replace("```c", "").replace("```", "").strip()
 
-    wiring_prompt = f"Map out explicit pin connections between the board: '{board}' and components: '{components}'. Format as a Markdown comparison table with columns: | {board} Pin | Header Pin Label | Target Device | Target Pin | Assigned Wire Color |"
-    wiring_instruction = "You are a hardware layout engineer. Output markdown connection matrices with bold color tags."
+    # CRITICAL: the wiring table must be derived FROM the code that was just
+    # generated, not guessed independently from the board/components text.
+    # Previously this was a second, blind API call that had never seen the
+    # actual firmware, so it would confidently invent a "plausible" pin
+    # (e.g. PC7) even when the code hardcoded a completely different one
+    # (e.g. PB0 via GPIOB_BSRR). Feeding the real code in as ground truth,
+    # plus a hard rule against inventing unseen pins, fixes that for any
+    # board/peripheral combination, not just this one.
+    wiring_prompt = (
+        f"Here is the ACTUAL generated firmware code for the '{board}' board:\n\n"
+        f"```\n{clean_code}\n```\n\n"
+        f"Components/peripherals requested: {components}\n\n"
+        "Read the code above and identify every physical pin it actually uses "
+        "(via register writes, HAL pin macros, digitalWrite/pinMode arguments, "
+        "GPIO numbers, etc). Then produce a Markdown table with columns: "
+        f"| {board} Pin | Header Pin Label | Target Device | Target Pin | Assigned Wire Color |\n\n"
+        "The pin listed in the table MUST be the exact pin the code uses — do not "
+        "substitute a different, more 'typical' pin. If a peripheral is requested "
+        "but you cannot find where the code actually drives it, write "
+        "'Not found in generated code' in that row instead of guessing."
+    )
+    wiring_instruction = (
+        "You are a hardware layout engineer whose only job is to transcribe pin "
+        "usage that is ALREADY PRESENT in the provided source code into a wiring "
+        "table. You must never invent, assume, or default to a pin the code does "
+        "not literally reference — the table has to match the code exactly, since "
+        "someone will wire real hardware based on it. Output markdown connection "
+        "matrices with bold color tags."
+    )
     raw_wiring, _ = safe_api_call(wiring_prompt, wiring_instruction, runtime_key)
     clean_wiring = raw_wiring.replace("```text", "").replace("```", "").strip()
-    
+    clean_wiring = _verify_wiring_matches_code(clean_wiring, clean_code)
+
     return clean_code, clean_wiring, active_key_used
 
 def generate_voice_explanation(board: str, components: str, runtime_key: str) -> tuple[str, str]:
