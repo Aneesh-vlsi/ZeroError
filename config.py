@@ -64,39 +64,123 @@ def safe_api_call(contents, system_instruction, manual_override_key=""):
             
     return "QUOTA_ERROR: All project credentials channels are exhausted.", "All Keys Exhausted"
 
-def _extract_pin_tokens(text: str) -> set:
+def _detect_code_style(code: str) -> dict:
+    """Determines which pin-naming conventions the generated code actually
+    uses, so extraction from the wiring table only looks for the same
+    conventions. Without this, STM32 Nucleo header labels like 'D9'/'D15'
+    (printed in wiring tables purely as Arduino-shield-compatible reference
+    labels) get mistaken for Arduino digital-pin numbers even when the real
+    code is plain HAL/register-based and never uses that naming at all —
+    producing false "mismatch" warnings on a perfectly correct table."""
+    return {
+        "arduino": bool(re.search(r'\b(?:pinMode|digitalWrite|digitalRead|analogWrite|analogRead)\s*\(', code))
+                   or bool(re.search(r'void\s+setup\s*\(', code, re.IGNORECASE)),
+        "esp": ("gpio_num_" in code.lower()) or ("esp32" in code.lower()) or ("esp8266" in code.lower()),
+    }
+
+
+def _extract_pin_tokens(text: str, style: dict = None) -> set:
     """Pulls out every concrete pin/GPIO reference actually present in a chunk
     of text (code or a wiring table). Used to cross-check that the wiring
     diagram isn't inventing pins the code never touches.
-    Covers: STM32 literal pins (PA5, PC7...), STM32 register bit-banging
-    (GPIOB_BSRR |= (1U << 0) -> PB0), Arduino D#/A# + pinMode/digitalWrite
-    argument style, and ESP32/8266 GPIO# style.
+
+    Covers:
+    - STM32 literal pins written directly (PA5, PC7...)
+    - STM32 CMSIS-style raw register bit-banging (GPIOB_BSRR |= (1U<<0) -> PB0)
+    - STM32Cube HAL style, where the port and pin are split across separate
+      #define macros and only joined later inside HAL_GPIO_Init/WritePin/etc.
+      This is the style the AI model outputs most often for STM32 boards, so
+      it needs its own resolution pass rather than a single regex.
+    - Arduino D#/A# + pinMode/digitalWrite argument style (only if the code
+      is actually Arduino-style; see _detect_code_style)
+    - ESP32/ESP8266 GPIO# style (only if the code is actually ESP-style)
     """
+    if style is None:
+        style = _detect_code_style(text)
     pins = set()
 
-    # STM32 explicit pin literals, e.g. PA5, PB12, PC7
+    # 1) STM32 explicit pin literals, e.g. PA5, PB12, PC7
     for m in re.finditer(r'\bP([A-K])(\d{1,2})\b', text, re.IGNORECASE):
         pins.add(f"P{m.group(1).upper()}{m.group(2)}")
 
-    # STM32 register-style bit-banging: GPIOx_<REG> ... << n  -> derive Pxn
+    # 2) STM32 register-style bit-banging: GPIOx_<REG> ... << n  -> derive Pxn
     # (BSRR's upper 16 bits are the "reset" half, so bit index is taken mod 16)
     for m in re.finditer(r'GPIO([A-K])[A-Za-z_]*\s*[|&]?=?~?\s*\(?\s*\d*U?\s*<<\s*(\d{1,2})', text, re.IGNORECASE):
         port, bit = m.group(1).upper(), int(m.group(2)) % 16
         pins.add(f"P{port}{bit}")
 
-    # Arduino-style D0-D99 references
-    for m in re.finditer(r'\bD(\d{1,2})\b', text):
-        pins.add(f"D{m.group(1)}")
+    # 3) STM32Cube HAL style: resolve #define macros, then trace them through
+    # HAL_GPIO_Init / WritePin / ReadPin / TogglePin calls.
+    macros = {}
+    for m in re.finditer(r'#define\s+(\w+)\s+([^\n/]+)', text):
+        macros[m.group(1)] = m.group(2).strip()
 
-    # Arduino function-call style: pinMode(9, ...), digitalWrite(13, ...)
-    for m in re.finditer(r'(?:pinMode|digitalWrite|digitalRead|analogWrite|analogRead)\s*\(\s*(\d{1,2})', text):
-        pins.add(f"D{m.group(1)}")
+    def expand(expr, depth=0):
+        if depth > 5:
+            return expr
+        changed = False
+        for name, val in macros.items():
+            new_expr, n = re.subn(rf'\b{re.escape(name)}\b', val, expr)
+            if n:
+                expr = new_expr
+                changed = True
+        return expand(expr, depth + 1) if changed else expr
 
-    # ESP32/ESP8266 style GPIO numbers
-    for m in re.finditer(r'GPIO_NUM_(\d{1,2})', text):
-        pins.add(f"GPIO{m.group(1)}")
-    for m in re.finditer(r'\bGPIO\s?(\d{1,2})\b', text, re.IGNORECASE):
-        pins.add(f"GPIO{m.group(1)}")
+    def port_letter(expr):
+        m = re.search(r'GPIO([A-K])\b', expr, re.IGNORECASE)
+        return m.group(1).upper() if m else None
+
+    def pin_numbers(expr):
+        return [int(n) for n in re.findall(r'GPIO_PIN_(\d{1,2})\b', expr, re.IGNORECASE)]
+
+    # Positional list of (offset, struct_name, expanded_pin_expr) so each
+    # HAL_GPIO_Init call can be paired with whichever ".Pin = ..." assignment
+    # most recently preceded it in the source — not just the last one in
+    # the whole file, since the same struct variable gets reused per pin.
+    pin_assignments = [
+        (m.start(), m.group(1), expand(m.group(2)))
+        for m in re.finditer(r'(\w+)\.Pin\s*=\s*([^;]+);', text)
+    ]
+
+    def most_recent_pin_before(offset, struct_name):
+        best = None
+        for pos, name, expr in pin_assignments:
+            if name == struct_name and pos < offset and (best is None or pos > best[0]):
+                best = (pos, expr)
+        return best[1] if best else ""
+
+    for m in re.finditer(r'HAL_GPIO_Init\s*\(\s*([^,]+),\s*&(\w+)\s*\)', text):
+        port_expr = expand(m.group(1))
+        pin_expr = most_recent_pin_before(m.start(), m.group(2))
+        port = port_letter(port_expr)
+        if port:
+            for n in pin_numbers(pin_expr):
+                pins.add(f"P{port}{n}")
+
+    for m in re.finditer(r'HAL_GPIO_(?:WritePin|ReadPin|TogglePin)\s*\(\s*([^,]+),\s*([^,)]+)', text):
+        port_expr = expand(m.group(1))
+        pin_expr = expand(m.group(2))
+        port = port_letter(port_expr)
+        if port:
+            for n in pin_numbers(pin_expr):
+                pins.add(f"P{port}{n}")
+
+    # 4) Arduino-style D0-D99 references — only meaningful if the code is
+    # actually Arduino-style, otherwise these collide with STM32 Nucleo
+    # header reference labels (e.g. "CN9 - Pin 2 (D9)") that mean something
+    # entirely different.
+    if style.get("arduino"):
+        for m in re.finditer(r'\bD(\d{1,2})\b', text):
+            pins.add(f"D{m.group(1)}")
+        for m in re.finditer(r'(?:pinMode|digitalWrite|digitalRead|analogWrite|analogRead)\s*\(\s*(\d{1,2})', text):
+            pins.add(f"D{m.group(1)}")
+
+    # 5) ESP32/ESP8266 style GPIO numbers — only if the code is ESP-style
+    if style.get("esp"):
+        for m in re.finditer(r'GPIO_NUM_(\d{1,2})', text):
+            pins.add(f"GPIO{m.group(1)}")
+        for m in re.finditer(r'\bGPIO\s?(\d{1,2})\b', text, re.IGNORECASE):
+            pins.add(f"GPIO{m.group(1)}")
 
     return pins
 
@@ -106,8 +190,9 @@ def _verify_wiring_matches_code(wiring_md: str, generated_code: str) -> str:
     referenced in the generated firmware. If the model drew a wiring diagram
     that doesn't correspond to what the code does, surface a visible warning
     instead of silently showing a possibly-wrong table."""
-    code_pins = _extract_pin_tokens(generated_code)
-    wiring_pins = _extract_pin_tokens(wiring_md)
+    style = _detect_code_style(generated_code)
+    code_pins = _extract_pin_tokens(generated_code, style)
+    wiring_pins = _extract_pin_tokens(wiring_md, style)
 
     # If we can't confidently extract pins from either side, don't guess —
     # just pass the table through unmodified rather than risk a false alarm.
