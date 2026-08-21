@@ -1,19 +1,8 @@
 # app.py
-import sys
-try:
-    import gradio as gr
-    from app_logic import handle_hardware_pipeline, handle_software_pipeline
-    from theme_engine import theme_engine_js, force_light_mode_js, stop_sfx_js, login_wall_css
-    from voice_engine import tts_javascript, stop_tts_javascript
-except Exception as e:
-    print(f"FATAL STARTUP CRASH: {e}")
-    sys.exit(1)
 import gradio as gr
 from app_logic import handle_hardware_pipeline, handle_software_pipeline
 from theme_engine import theme_engine_js, force_light_mode_js, stop_sfx_js, login_wall_css
 from voice_engine import tts_javascript, stop_tts_javascript
-# Add this temporary block right at the very top of app.py
-
 
 # Client-side processing script that handles custom naming and system-level download location prompts
 download_hw_js = """
@@ -108,7 +97,17 @@ with gr.Blocks() as app:
                     board_input = gr.Textbox(label="1️⃣ Enter Target Microcontroller Board Name", placeholder="e.g., STM32 H743ZI2, ESP32, Arduino Uno", value="")
                 with gr.Column(scale=2):
                     components_input = gr.Textbox(label="2️⃣ Enter Required Sensors, Pins, and Displays Profile", placeholder="e.g., sense distance via ultrasonic sensor and show on oled screen", value="", lines=2)
-            
+
+            with gr.Accordion("🌐 Optional: Host a Web Page (ESP8266 / ESP32 only)", open=False):
+                gr.Markdown(
+                    "*If your target board is WiFi-capable, drag & drop an `.html` file below (or paste "
+                    "raw HTML) and the generated firmware will serve it exactly as-is from a built-in "
+                    "web server — your page is embedded byte-for-byte, not rewritten by the AI.*"
+                )
+                with gr.Row():
+                    hw_html_file_input = gr.File(label="Drag & drop an .html file here", file_types=[".html", ".htm"], type="filepath")
+                    hw_html_paste_input = gr.Code(label="...or paste raw HTML here instead", language="html", lines=8)
+
             compile_hw_btn = gr.Button("⚡ Run Multi-Pass Code Compilation & Wire Mapping Pass", variant="primary")
             
             with gr.Row():
@@ -180,7 +179,7 @@ with gr.Blocks() as app:
     # Hardware Pipeline Trigger Mapping
     compile_hw_btn.click(
         fn=handle_hardware_pipeline,
-        inputs=[board_input, components_input, manual_key_input],
+        inputs=[board_input, components_input, manual_key_input, hw_html_file_input, hw_html_paste_input],
         outputs=[hw_log_output, hw_code_output, hw_wiring_output, hw_raw_download_cache, hw_voice_cache, bus_status_display]
     )
 
@@ -205,16 +204,13 @@ with gr.Blocks() as app:
     sw_play_btn.click(fn=None, inputs=[voice_persona_dropdown, sw_voice_cache, sw_raw_download_cache], js=tts_javascript)
     sw_stop_btn.click(fn=None, inputs=None, js=stop_tts_javascript)
 
-import os # Make sure this is added to fetch environment variables
-
 if __name__ == "__main__":
     app.launch(
         auth=("ZeroError", "123456"),
         auth_message="Please log in with your authorized Arro engine credentials.",
         server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)), # <--- CRITICAL FIX
+        server_port=7860,
         theme=gr.themes.Default(),
         js=force_light_mode_js,
-        css=login_wall_css,
-        ssr_mode=False
+        css=login_wall_css
     )
