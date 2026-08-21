@@ -214,7 +214,45 @@ def _verify_wiring_matches_code(wiring_md: str, generated_code: str) -> str:
     return wiring_md
 
 
-def infer_hardware_and_generate_code(board: str, components: str, runtime_key: str) -> tuple[str, str, str]:
+HTML_PLACEHOLDER_TOKEN = "__ZES_USER_HTML_PLACEHOLDER__"
+
+# Boards in this app's supported list that have a native/typical WiFi stack
+# in the Arduino/ESP-IDF ecosystem. Hosting a page on anything outside this
+# list (e.g. a bare STM32 or Arduino Uno with no WiFi shield) isn't possible
+# with the code this tool generates, so it's rejected up front rather than
+# producing firmware that silently can't do what was asked.
+_WIFI_CAPABLE_KEYWORDS = ["esp32", "esp8266"]
+
+
+def _find_safe_progmem_delimiter(html_content: str) -> str:
+    """C++11 raw string literals R"delim(...)delim" break if the delimiter
+    text happens to appear inside the content immediately followed by
+    ')' + delimiter + '"'. 'rawliteral' is the conventional default; if the
+    user's own HTML happens to contain that exact sequence, fall back to
+    alternates so their page doesn't get silently truncated mid-file."""
+    candidates = ["rawliteral", "zeshtmlpage", "webcontent01"]
+    for delim in candidates:
+        if f'){delim}"' not in html_content:
+            return delim
+    import hashlib
+    return "h" + hashlib.md5(html_content.encode("utf-8", "ignore")).hexdigest()[:10]
+
+
+def embed_html_in_progmem(html_content: str, var_name: str = "index_html") -> str:
+    """Wraps user-supplied HTML into a PROGMEM raw string literal block, the
+    format ESP8266WebServer/ESP32 WebServer sketches expect. Done as a pure
+    Python string operation rather than routed through the LLM, so the page
+    is embedded byte-for-byte instead of risking the model paraphrasing,
+    reformatting, or truncating markup it was only supposed to transcribe."""
+    delim = _find_safe_progmem_delimiter(html_content)
+    return (
+        f'const char {var_name}[] PROGMEM = R"{delim}(\n'
+        f'{html_content}\n'
+        f'){delim}";'
+    )
+
+
+def infer_hardware_and_generate_code(board: str, components: str, runtime_key: str, hosted_html: str = "") -> tuple[str, str, str]:
     clean_board = board.strip().lower()
     
     restricted_software_terms = ["server", "client", "website", "webpage", "database", "api", "cloud", "application", "app", "ui", "ux", "odometer", "html", "css", "javascript", "my computer", "pc", "laptop"]
@@ -245,7 +283,42 @@ def infer_hardware_and_generate_code(board: str, components: str, runtime_key: s
         )
         return error_msg, error_diagram, "No Key Used"
 
-    code_prompt = f"Target MCU Board: {board}\nRequested Peripherals: {components}\nWrite full operational C/C++ firmware code directly without markdown wrappers."
+    is_wifi_capable = any(kw in clean_board for kw in _WIFI_CAPABLE_KEYWORDS)
+    hosting_requested = bool(hosted_html and hosted_html.strip())
+
+    if hosting_requested and not is_wifi_capable:
+        error_msg = (
+            f"// ❌ COMPILATION TERMINATED: HTML HOSTING NOT SUPPORTED ON '{board}'\n"
+            f"// Error: hosting a web page requires a WiFi-capable board (ESP8266 or ESP32).\n"
+            f"// '{board}' has no networking stack in this toolchain, so the page "
+            f"you pasted can't actually be served from it."
+        )
+        error_diagram = (
+            "### ❌ HTML Hosting Requires a WiFi-Capable Board\n\n"
+            f"**Reason:** '{board}' cannot run a web server. Switch the target board "
+            "to ESP8266 or ESP32 to host the page you pasted."
+        )
+        return error_msg, error_diagram, "No Key Used"
+
+    if hosting_requested:
+        code_prompt = (
+            f"Target MCU Board: {board}\n"
+            f"Requested Peripherals: {components}\n\n"
+            "This sketch must also run a WiFi web server (AP mode via WiFi.softAP is "
+            "fine unless station credentials are clearly implied by the requirements) "
+            "that serves a hosted HTML page on the root '/' route.\n\n"
+            "IMPORTANT: Do NOT write out any HTML page content yourself. Instead, at "
+            f"the point where you would declare the page constant, insert this EXACT "
+            f"line verbatim and nothing else on that line: {HTML_PLACEHOLDER_TOKEN}\n"
+            "Assume that line will be replaced with a valid "
+            "'const char index_html[] PROGMEM = ...;' declaration before compiling. "
+            "Write the WiFi setup, a route handler that serves it via "
+            "server.send_P(200, \"text/html\", index_html), and all sensor/peripheral "
+            "logic for the requested components, directly without markdown wrappers."
+        )
+    else:
+        code_prompt = f"Target MCU Board: {board}\nRequested Peripherals: {components}\nWrite full operational C/C++ firmware code directly without markdown wrappers."
+
     code_instruction = "You are an expert embedded firmware validator. Output clean C/C++ source code text only."
     raw_code, active_key_used = safe_api_call(code_prompt, code_instruction, runtime_key)
     
@@ -253,6 +326,15 @@ def infer_hardware_and_generate_code(board: str, components: str, runtime_key: s
         return raw_code, "### ❌ Quota system limit exceeded.", active_key_used
 
     clean_code = raw_code.replace("```cpp", "").replace("```c", "").replace("```", "").strip()
+
+    if hosting_requested:
+        progmem_block = embed_html_in_progmem(hosted_html)
+        if HTML_PLACEHOLDER_TOKEN in clean_code:
+            clean_code = clean_code.replace(HTML_PLACEHOLDER_TOKEN, progmem_block)
+        else:
+            # Model didn't follow the placeholder instruction — prepend the
+            # user's page rather than silently dropping it from the output.
+            clean_code = progmem_block + "\n\n" + clean_code
 
     # CRITICAL: the wiring table must be derived FROM the code that was just
     # generated, not guessed independently from the board/components text.
