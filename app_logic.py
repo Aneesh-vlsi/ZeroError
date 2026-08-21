@@ -5,7 +5,7 @@ import re
 import html
 from config import infer_hardware_and_generate_code, generate_voice_explanation, generate_pure_software_code
 
-def handle_hardware_pipeline(board: str, components: str, runtime_key: str):
+def handle_hardware_pipeline(board: str, components: str, runtime_key: str, hosted_html_file=None, hosted_html_text: str = ""):
     """Handles physical firmware validation pipelines, executing strict target board guards."""
     if not board.strip() or not components.strip():
         return (
@@ -16,8 +16,21 @@ def handle_hardware_pipeline(board: str, components: str, runtime_key: str):
             "The workspace target parameters are currently empty.", 
             "Status: Aborted due to unpopulated configuration blocks."
         )
-        
-    compiled_code, wiring_diagram, key_used = infer_hardware_and_generate_code(board, components, runtime_key)
+
+    # Resolve the page to host: a dropped/uploaded .html file takes priority
+    # over pasted text if both are somehow present, since a file upload is
+    # the more deliberate action.
+    resolved_html = ""
+    if hosted_html_file:
+        try:
+            with open(hosted_html_file, "r", encoding="utf-8", errors="ignore") as f:
+                resolved_html = f.read()
+        except Exception:
+            resolved_html = ""
+    if not resolved_html and hosted_html_text and hosted_html_text.strip():
+        resolved_html = hosted_html_text
+
+    compiled_code, wiring_diagram, key_used = infer_hardware_and_generate_code(board, components, runtime_key, resolved_html)
     
     # FIXED: Expands error detection to capture manual token override crashes and quota blocks dynamically
     if ("COMPILATION REJECTED" in compiled_code or 
